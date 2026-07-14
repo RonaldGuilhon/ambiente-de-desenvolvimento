@@ -29,12 +29,21 @@ class GlassFishConfig:
     STARTUP_TIMEOUT = 60  # Timeout para inicialização do GlassFish (segundos)
 
     @classmethod
-    def get_glassfish_path(cls) -> Path:
-        """Retorna o caminho do GlassFish, verificando variável de ambiente."""
+    def get_glassfish_home(cls) -> Path:
+        """Retorna o caminho raiz do GlassFish (onde está o asadmin.bat)."""
         env_path = os.environ.get("GLASSFISH_HOME")
         if env_path:
             return Path(env_path)
         return cls.DEFAULT_GLASSFISH_PATH
+
+    @classmethod
+    def get_glassfish_path(cls) -> Path:
+        """Retorna o caminho do GlassFish (com subpasta glassfish se existir)."""
+        home = cls.get_glassfish_home()
+        glassfish_subdir = home / "glassfish"
+        if glassfish_subdir.exists():
+            return glassfish_subdir
+        return home
 
     @classmethod
     def get_asadmin_path(cls) -> Path:
@@ -67,9 +76,14 @@ class GlassFishConfig:
     @classmethod
     def validate_glassfish_installation(cls) -> tuple[bool, str]:
         """Valida se o GlassFish está instalado corretamente."""
+        home = cls.get_glassfish_home()
         gf_path = cls.get_glassfish_path()
+
         if not gf_path.exists():
-            return False, f"Diretório do GlassFish não encontrado: {gf_path}"
+            return False, (
+                f"Diretório do GlassFish não encontrado: {gf_path}\n"
+                f"Verifique se o GLASSFISH_HOME está configurado corretamente."
+            )
 
         asadmin = cls.get_asadmin_path()
         if not asadmin.exists():
@@ -79,4 +93,9 @@ class GlassFishConfig:
         if not domains_dir.exists():
             return False, f"Diretório de domínios não encontrado: {domains_dir}"
 
-        return True, "GlassFish instalado corretamente"
+        info = (
+            f"GlassFish encontrado em: {gf_path}\n"
+            f"Asadmin: {asadmin}\n"
+            f"Domínios: {domains_dir}"
+        )
+        return True, info

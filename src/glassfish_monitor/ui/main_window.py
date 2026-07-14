@@ -1,7 +1,6 @@
 """Janela principal da aplicação GlassFish Monitor."""
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
@@ -12,8 +11,10 @@ from PySide6.QtWidgets import (
 )
 
 from glassfish_monitor.services.glassfish_service import GlassFishService, ServerStatus
+from glassfish_monitor.services.mysql_service import MySQLService, MySQLStatus
+from glassfish_monitor.services.postgres_service import PostgresService, PostgresStatus
 from glassfish_monitor.ui.styles.themes import GlassFishStyles
-from glassfish_monitor.ui.tabs.future_tab import FutureTab
+from glassfish_monitor.ui.tabs.database_tab import DatabaseTab
 from glassfish_monitor.ui.tabs.glassfish_tab import GlassFishTab
 
 
@@ -23,15 +24,15 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self._gf_service = GlassFishService()
+        self._mysql_service = MySQLService()
+        self._postgres_service = PostgresService()
+        self._tabs: list[tuple[QWidget, object]] = []
         self._setup_ui()
-        self._connect_signals()
 
     def _setup_ui(self) -> None:
-        """Configura a interface da janela principal."""
-        self.setWindowTitle("GlassFish Monitor v1.0.0")
-        self.setMinimumSize(QSize(1200, 800))
-        self.resize(1400, 900)
-
+        self.setWindowTitle("Ambiente de Desenvolvimento")
+        self.setMinimumSize(QSize(1100, 700))
+        self.resize(1200, 800)
         self.setStyleSheet(GlassFishStyles.get_stylesheet())
 
         central_widget = QWidget()
@@ -45,11 +46,30 @@ class MainWindow(QMainWindow):
         self._tab_widget.setDocumentMode(True)
 
         self._glassfish_tab = GlassFishTab(self._gf_service)
-        self._tab_widget.addTab(self._glassfish_tab, "GlassFish Server")
+        self._tab_widget.addTab(self._glassfish_tab, "GlassFish")
+        self._tabs.append((self._glassfish_tab, self._gf_service))
 
-        self._tab_widget.addTab(FutureTab("Deploy & Gerenciamento"), "Deploy")
-        self._tab_widget.addTab(FutureTab("Configurações"), "Configurações")
-        self._tab_widget.addTab(FutureTab("Logs Avançados"), "Logs")
+        self._mysql_tab = DatabaseTab(
+            service_name="MySQL",
+            service=self._mysql_service,
+            status_enum_running=MySQLStatus.RUNNING,
+            status_enum_stopped=MySQLStatus.STOPPED,
+            port=3306,
+            admin_url="http://localhost:3306",
+        )
+        self._tab_widget.addTab(self._mysql_tab, "MySQL")
+        self._tabs.append((self._mysql_tab, self._mysql_service))
+
+        self._postgres_tab = DatabaseTab(
+            service_name="PostgreSQL",
+            service=self._postgres_service,
+            status_enum_running=PostgresStatus.RUNNING,
+            status_enum_stopped=PostgresStatus.STOPPED,
+            port=5432,
+            admin_url="http://localhost:5432",
+        )
+        self._tab_widget.addTab(self._postgres_tab, "PostgreSQL")
+        self._tabs.append((self._postgres_tab, self._postgres_service))
 
         self._tab_widget.currentChanged.connect(self._on_tab_changed)
 
@@ -58,56 +78,24 @@ class MainWindow(QMainWindow):
         self._setup_status_bar()
 
     def _setup_status_bar(self) -> None:
-        """Configura a barra de status."""
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
 
-        self._connection_status = QLabel("GlassFish Monitor")
-        self._connection_status.setStyleSheet("padding: 2px 10px;")
-        self._status_bar.addWidget(self._connection_status)
-
-        self._server_info = QLabel("")
-        self._server_info.setStyleSheet("padding: 2px 10px; color: #B0B0B0;")
-        self._status_bar.addPermanentWidget(self._server_info)
-
-    def _connect_signals(self) -> None:
-        """Conecta os sinais."""
-        self._gf_service.status_changed.connect(self._on_status_changed)
-
-    def initialize(self) -> None:
-        """Inicializa a aplicação."""
-        self._glassfish_tab.initialize()
-        self._update_server_info()
+        self._server_info = QLabel("Ambiente de Desenvolvimento")
+        self._server_info.setStyleSheet("padding: 2px 10px;")
+        self._status_bar.addWidget(self._server_info)
 
     def _on_tab_changed(self, index: int) -> None:
-        """Callback quando a aba é alterada."""
-        if index == 0:
-            self._glassfish_tab.initialize()
-        else:
-            self._glassfish_tab.shutdown()
+        for i, (tab, service) in enumerate(self._tabs):
+            if i == index:
+                tab.initialize()
+            else:
+                tab.shutdown()
 
-    def _on_status_changed(self, status: ServerStatus) -> None:
-        """Callback quando o status muda."""
-        status_text = {
-            ServerStatus.RUNNING: "Servidor Ativo",
-            ServerStatus.STOPPED: "Servidor Parado",
-            ServerStatus.RESTART_REQUIRED: "Reinício Necessário",
-            ServerStatus.UNKNOWN: "Verificando...",
-            ServerStatus.ERROR: "Erro de Conexão",
-        }
-        self._connection_status.setText(status_text.get(status, "Desconhecido"))
-
-    def _update_server_info(self) -> None:
-        """Atualiza as informações do servidor na barra de status."""
-        version = self._gf_service.get_version()
-        if version:
-            self._server_info.setText(
-                f"{version.product_name} | Porta: {self._gf_service.domain_name}"
-            )
-        else:
-            self._server_info.setText(f"Domínio: {self._gf_service.domain_name}")
+    def initialize(self) -> None:
+        self._glassfish_tab.initialize()
 
     def closeEvent(self, event) -> None:
-        """Trata o evento de fechamento da janela."""
-        self._glassfish_tab.shutdown()
+        for tab, _ in self._tabs:
+            tab.shutdown()
         event.accept()

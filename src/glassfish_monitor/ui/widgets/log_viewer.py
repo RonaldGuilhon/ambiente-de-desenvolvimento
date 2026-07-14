@@ -167,7 +167,7 @@ class LogViewer(QFrame):
                 start_idx = max(0, len(lines) - max_lines)
 
                 for line in lines[start_idx:]:
-                    self._append_log_line(line.rstrip())
+                    self.append_log_line(line.rstrip())
 
                 self._last_position = self._log_path.stat().st_size
                 self._total_lines = len(lines)
@@ -197,7 +197,7 @@ class LogViewer(QFrame):
                 self._last_position = f.tell()
 
                 for line in new_lines:
-                    self._append_log_line(line.rstrip())
+                    self.append_log_line(line.rstrip())
                     self._total_lines += 1
 
                 self._update_line_count()
@@ -205,7 +205,7 @@ class LogViewer(QFrame):
         except Exception as e:
             logger.debug(f"Erro ao atualizar logs: {e}")
 
-    def _append_log_line(self, line: str) -> None:
+    def append_log_line(self, line: str) -> None:
         """Adiciona uma linha ao log."""
         if self._filter_text and self._filter_text.lower() not in line.lower():
             return

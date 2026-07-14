@@ -107,7 +107,14 @@ class StatusWidget(QFrame):
             ServerStatus.ERROR: "Falha ao verificar status do servidor",
         }
 
-        color = Colors.get_status_indicator_color(status.value)
+        _color_map = {
+            "running": Colors.SUCCESS,
+            "stopped": Colors.ERROR,
+            "restart_required": Colors.WARNING,
+            "unknown": Colors.TEXT_DISABLED,
+            "error": Colors.ERROR,
+        }
+        color = _color_map.get(status.value, Colors.TEXT_DISABLED)
 
         self._indicator.set_color(color)
         self._status_label.setText(f"Status: {status_text.get(status, 'Desconhecido')}")

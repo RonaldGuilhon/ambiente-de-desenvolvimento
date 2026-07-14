@@ -13,7 +13,7 @@ Aplicação desktop para monitoramento e controle do GlassFish Server.
 ## Pré-requisitos
 
 - Python 3.10+
-- GlassFish 4.1.1 instalado em `C:\Program Files\glassfish-4.1.1`
+- GlassFish 4.1.1 instalado em `C:\Program Files\glassfish-4.1.1\glassfish`
 - Windows 10/11
 
 ## Instalação

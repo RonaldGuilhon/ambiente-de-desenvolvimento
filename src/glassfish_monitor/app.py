@@ -19,7 +19,7 @@ def create_app(sys_argv: list[str]) -> QApplication:
     app.setOrganizationName("GlassFish Monitor")
     app.setStyle("Fusion")
 
-    app.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetsSiblings)
+    app.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings)
 
     return app
 

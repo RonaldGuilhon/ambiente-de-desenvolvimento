@@ -83,6 +83,15 @@ class StatusWorker(QObject):
         return DomainInfo(name=domain_name, status=ServerStatus.UNKNOWN)
 
 
+@dataclass
+class DeployedApp:
+    """Aplicação deployada no GlassFish."""
+
+    name: str
+    context_root: str = ""
+    status: str = ""
+
+
 class GlassFishService(QObject):
     """Serviço principal de interação com o GlassFish."""
 
@@ -312,3 +321,28 @@ class GlassFishService(QObject):
     def cancel_all_operations(self) -> None:
         """Cancela todas as operações em andamento."""
         self._process_manager.cancel_all()
+
+    def list_deployed_apps(self) -> list[DeployedApp]:
+        """Lista aplicações deployadas no GlassFish."""
+        result = self._process_manager.run_command(
+            ["list-applications", "--long"]
+        )
+        if not result.success:
+            return []
+
+        apps: list[DeployedApp] = []
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if not line or "Command" in line:
+                continue
+            parts = line.split()
+            if len(parts) >= 1:
+                name = parts[0]
+                context_root = ""
+                status_str = "enabled"
+                if len(parts) >= 2:
+                    context_root = parts[1]
+                if "disabled" in line.lower():
+                    status_str = "disabled"
+                apps.append(DeployedApp(name=name, context_root=context_root, status=status_str))
+        return apps

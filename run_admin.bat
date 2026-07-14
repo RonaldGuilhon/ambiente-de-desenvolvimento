@@ -1,32 +1,10 @@
 @echo off
 REM ============================================
-REM GlassFish Monitor - Elevação Automática UAC
+REM GlassFish Monitor - Script Admin (chamado pelo UAC)
 REM ============================================
 
-:: Verificar se já é administrador
-fsutil dirty query %systemdrive% >nul 2>&1
-if %errorLevel% == 0 (
-    goto :ADMIN
-) else (
-    goto :ELEVATE
-)
+cd /d "%~dp0"
 
-:ELEVATE
-echo [INFO] Solicitando permissões de administrador...
-echo [INFO] O GlassFish em "Program Files" requer permissões elevadas.
-echo.
-
-:: Criar script VBS para elevação
-set "VBS=%temp%\elevate_gfmon.vbs"
-echo Set objShell = CreateObject("Shell.Application") > "%VBS%"
-echo objShell.ShellExecute "cmd.exe", "/c cd /d ""%~dp0"" && call run_admin.bat", "", "runas", 1 >> "%VBS%"
-
-:: Executar o VBS
-cscript //nologo "%VBS%"
-del "%VBS%" >nul 2>&1
-exit /b
-
-:ADMIN
 echo ===================================
 echo    GlassFish Monitor v1.0.0
 echo ===================================

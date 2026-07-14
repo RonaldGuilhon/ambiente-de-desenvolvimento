@@ -1,24 +1,120 @@
 """Aba principal de monitoramento do GlassFish."""
 
-from PySide6.QtCore import Qt, Slot
+import webbrowser
+
+from loguru import logger
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSplitter,
+    QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from glassfish_monitor.config import GlassFishConfig
-from glassfish_monitor.services.glassfish_service import GlassFishService, ServerStatus
-from glassfish_monitor.services.monitor_service import MonitorService, ResourceMetrics
+from glassfish_monitor.services.glassfish_service import (
+    DeployedApp,
+    GlassFishService,
+    ServerStatus,
+)
 from glassfish_monitor.ui.styles.themes import Colors
-from glassfish_monitor.ui.widgets.log_viewer import LogViewer
-from glassfish_monitor.ui.widgets.metrics_panel import MetricsPanel
 from glassfish_monitor.ui.widgets.status_widget import StatusWidget
+
+
+class AppListWorker(QObject):
+    """Worker para buscar aplicações em background."""
+
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, service: GlassFishService) -> None:
+        super().__init__()
+        self._service = service
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            apps = self._service.list_deployed_apps()
+            self.finished.emit(apps)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class InfoCard(QFrame):
+    """Card de informações."""
+
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(f"""
+            InfoCard {{
+                background-color: {Colors.SURFACE};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+            }}
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 12, 15, 12)
+        layout.setSpacing(8)
+
+        self._title = QLabel(title)
+        self._title.setStyleSheet(f"""
+            font-size: 13px;
+            font-weight: bold;
+            color: {Colors.PRIMARY};
+        """)
+        layout.addWidget(self._title)
+
+        self._content_layout = QVBoxLayout()
+        self._content_layout.setSpacing(4)
+        layout.addLayout(self._content_layout)
+
+    def add_row(self, label: str, value: str, clickable: bool = False) -> QLabel:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        lbl = QLabel(f"{label}:")
+        lbl.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 12px;")
+        lbl.setFixedWidth(120)
+        row.addWidget(lbl)
+
+        val = QLabel(value)
+        if clickable:
+            val.setStyleSheet(f"""
+                color: {Colors.PRIMARY_LIGHT};
+                font-size: 12px;
+                text-decoration: underline;
+            """)
+            val.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            val.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 12px;")
+        row.addWidget(val)
+        row.addStretch()
+
+        self._content_layout.addLayout(row)
+        return val
+
+    def add_separator(self) -> None:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet(f"background-color: {Colors.BORDER}; max-height: 1px;")
+        self._content_layout.addWidget(line)
+
+    def clear_content(self) -> None:
+        while self._content_layout.count():
+            item = self._content_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    sub = item.layout().takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
 
 
 class GlassFishTab(QWidget):
@@ -27,79 +123,76 @@ class GlassFishTab(QWidget):
     def __init__(self, glassfish_service: GlassFishService, parent=None) -> None:
         super().__init__(parent)
         self._gf_service = glassfish_service
-        self._monitor_service = MonitorService(glassfish_service)
         self._is_starting = False
         self._is_stopping = False
+        self._worker_thread: QThread | None = None
+        self._admin_url = f"http://localhost:{GlassFishConfig.ADMIN_PORT}"
+        self._http_url = f"http://localhost:{GlassFishConfig.HTTP_PORT}"
         self._setup_ui()
         self._connect_signals()
 
     def _setup_ui(self) -> None:
-        """Configura a interface da aba."""
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(15)
 
-        header_layout = QHBoxLayout()
-
+        header = QHBoxLayout()
         title = QLabel("GlassFish Server")
         title.setStyleSheet(f"""
-            font-size: 20px;
+            font-size: 22px;
             font-weight: bold;
             color: {Colors.PRIMARY};
         """)
-        header_layout.addWidget(title)
-        header_layout.addStretch()
+        header.addWidget(title)
+        header.addStretch()
 
-        self._version_label = QLabel("GlassFish 4.1.1")
+        self._version_label = QLabel("")
         self._version_label.setStyleSheet(f"""
             font-size: 12px;
             color: {Colors.TEXT_SECONDARY};
         """)
-        header_layout.addWidget(self._version_label)
-
-        main_layout.addLayout(header_layout)
+        header.addWidget(self._version_label)
+        main_layout.addLayout(header)
 
         self._status_widget = StatusWidget()
         main_layout.addWidget(self._status_widget)
 
-        controls_group = QFrame()
-        controls_group.setFrameShape(QFrame.Shape.StyledPanel)
-        controls_group.setStyleSheet(f"""
+        controls = QFrame()
+        controls.setFrameShape(QFrame.Shape.StyledPanel)
+        controls.setStyleSheet(f"""
             QFrame {{
                 background-color: {Colors.SURFACE};
                 border: 1px solid {Colors.BORDER};
                 border-radius: 8px;
-                padding: 10px;
             }}
         """)
-        controls_layout = QHBoxLayout(controls_group)
+        controls_layout = QHBoxLayout(controls)
+        controls_layout.setContentsMargins(12, 8, 12, 8)
         controls_layout.setSpacing(10)
 
         self._start_button = QPushButton("Iniciar")
         self._start_button.setObjectName("startButton")
-        self._start_button.setMinimumHeight(40)
-        self._start_button.setMinimumWidth(120)
+        self._start_button.setMinimumHeight(36)
+        self._start_button.setMinimumWidth(110)
         self._start_button.clicked.connect(self._on_start_clicked)
         controls_layout.addWidget(self._start_button)
 
         self._stop_button = QPushButton("Parar")
         self._stop_button.setObjectName("stopButton")
-        self._stop_button.setMinimumHeight(40)
-        self._stop_button.setMinimumWidth(120)
+        self._stop_button.setMinimumHeight(36)
+        self._stop_button.setMinimumWidth(110)
         self._stop_button.clicked.connect(self._on_stop_clicked)
         controls_layout.addWidget(self._stop_button)
 
         self._restart_button = QPushButton("Reiniciar")
         self._restart_button.setObjectName("restartButton")
-        self._restart_button.setMinimumHeight(40)
-        self._restart_button.setMinimumWidth(120)
+        self._restart_button.setMinimumHeight(36)
+        self._restart_button.setMinimumWidth(110)
         self._restart_button.clicked.connect(self._on_restart_clicked)
         controls_layout.addWidget(self._restart_button)
 
-        controls_layout.addSpacing(20)
-
-        self._refresh_button = QPushButton("Atualizar Status")
-        self._refresh_button.setMinimumHeight(40)
+        self._refresh_button = QPushButton("Atualizar")
+        self._refresh_button.setMinimumHeight(36)
         self._refresh_button.clicked.connect(self._on_refresh_clicked)
         controls_layout.addWidget(self._refresh_button)
 
@@ -113,55 +206,140 @@ class GlassFishTab(QWidget):
         """)
         controls_layout.addWidget(self._operation_label)
 
-        main_layout.addWidget(controls_group)
+        main_layout.addWidget(controls)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
 
-        self._metrics_panel = MetricsPanel()
-        splitter.addWidget(self._metrics_panel)
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet("background: transparent;")
+        content_layout = QVBoxLayout(scroll_content)
+        content_layout.setSpacing(12)
 
-        self._log_viewer = LogViewer()
-        splitter.addWidget(self._log_viewer)
+        info_layout = QHBoxLayout()
+        info_layout.setSpacing(12)
 
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        self._ports_card = InfoCard("Portas")
+        self._ports_card.add_row("Admin", str(GlassFishConfig.ADMIN_PORT))
+        self._ports_card.add_row("HTTP", str(GlassFishConfig.HTTP_PORT))
+        self._ports_card.add_row("HTTPS", str(GlassFishConfig.HTTPS_PORT))
+        info_layout.addWidget(self._ports_card)
 
-        main_layout.addWidget(splitter)
+        self._links_card = InfoCard("Links")
+        self._admin_link = self._links_card.add_row(
+            "Admin Console", self._admin_url, clickable=True
+        )
+        self._admin_link.mousePressEvent = lambda _: webbrowser.open(self._admin_url)
+
+        self._http_link = self._links_card.add_row(
+            "Aplicações", self._http_url, clickable=True
+        )
+        self._http_link.mousePressEvent = lambda _: webbrowser.open(self._http_url)
+        info_layout.addWidget(self._links_card)
+
+        content_layout.addLayout(info_layout)
+
+        self._apps_card = InfoCard("Aplicações Deployadas")
+        self._apps_table = QTableWidget()
+        self._apps_table.setColumnCount(3)
+        self._apps_table.setHorizontalHeaderLabels(["Nome", "Context Root", "Status"])
+        self._apps_table.horizontalHeader().setStretchLastSection(True)
+        self._apps_table.horizontalHeader().setSectionResizeMode(0, self._apps_table.horizontalHeader().ResizeMode.Stretch)
+        self._apps_table.horizontalHeader().setSectionResizeMode(1, self._apps_table.horizontalHeader().ResizeMode.Stretch)
+        self._apps_table.verticalHeader().setVisible(False)
+        self._apps_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._apps_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._apps_table.setAlternatingRowColors(True)
+        self._apps_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {Colors.SURFACE_LIGHT};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 4px;
+                gridline-color: {Colors.BORDER};
+            }}
+            QTableWidget::item {{
+                padding: 6px;
+            }}
+            QTableWidget::item:selected {{
+                background-color: {Colors.PRIMARY_DARK};
+            }}
+            QHeaderView::section {{
+                background-color: {Colors.SURFACE};
+                color: {Colors.TEXT_PRIMARY};
+                padding: 6px;
+                border: 1px solid {Colors.BORDER};
+                font-weight: bold;
+            }}
+        """)
+        self._apps_table.setMinimumHeight(150)
+        self._apps_card._content_layout.addWidget(self._apps_table)
+        content_layout.addWidget(self._apps_card)
+
+        content_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        main_layout.addWidget(scroll)
 
         self._update_buttons_state(ServerStatus.UNKNOWN)
 
     def _connect_signals(self) -> None:
-        """Conecta os sinais dos serviços."""
         self._gf_service.status_changed.connect(self._on_status_changed)
         self._gf_service.command_executed.connect(self._on_command_executed)
         self._gf_service.error_occurred.connect(self._on_error_occurred)
-        self._gf_service.log_message.connect(self._on_log_message)
-
-        self._monitor_service.metrics_updated.connect(self._on_metrics_updated)
-        self._monitor_service.history_updated.connect(self._on_history_updated)
-
-        self._status_widget.status_changed.connect(self._on_status_widget_changed)
 
     def initialize(self) -> None:
-        """Inicializa a aba - chamado quando a aba é selecionada."""
         valid, message = self._gf_service.validate_installation()
-        if not valid:
-            self._log_viewer.append_log_line(f"[AVISO] {message}")
-
-        log_path = GlassFishConfig.get_domain_log_path()
-        if log_path.exists():
-            self._log_viewer.set_log_path(log_path)
+        if valid:
+            lines = message.split("\n")
+            for line in lines:
+                if line.startswith("Asadmin:"):
+                    pass
+                elif line.startswith("Domínios:"):
+                    pass
+                elif line.startswith("GlassFish"):
+                    self._version_label.setText(line.replace("GlassFish encontrado em: ", ""))
 
         self._gf_service.check_status_async()
-        self._monitor_service.start_monitoring()
+        self._refresh_apps()
 
     def shutdown(self) -> None:
-        """Desliga a aba - chamado quando a aba é desselecionada."""
-        self._monitor_service.stop_monitoring()
         self._gf_service.cancel_all_operations()
 
+    def _refresh_apps(self) -> None:
+        if self._gf_service.current_status != ServerStatus.RUNNING:
+            self._apps_table.setRowCount(0)
+            return
+
+        self._worker_thread = QThread()
+        worker = AppListWorker(self._gf_service)
+        worker.moveToThread(self._worker_thread)
+        worker.finished.connect(self._on_apps_loaded)
+        worker.error.connect(lambda e: logger.error(f"Erro ao listar apps: {e}"))
+        self._worker_thread.started.connect(worker.run)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.start()
+
+    def _on_apps_loaded(self, apps: list[DeployedApp]) -> None:
+        self._apps_table.setRowCount(len(apps))
+        for i, app in enumerate(apps):
+            name_item = QTableWidgetItem(app.name)
+            root_item = QTableWidgetItem(app.context_root)
+            status_item = QTableWidgetItem(app.status)
+
+            if app.status == "disabled":
+                status_item.setForeground(self._status_widget._indicator.palette().color(
+                    self._status_widget._indicator.foregroundRole()
+                ))
+
+            self._apps_table.setItem(i, 0, name_item)
+            self._apps_table.setItem(i, 1, root_item)
+            self._apps_table.setItem(i, 2, status_item)
+
+        self._apps_table.resizeColumnsToContents()
+
     def _update_buttons_state(self, status: ServerStatus) -> None:
-        """Atualiza o estado dos botões baseado no status."""
         is_running = status == ServerStatus.RUNNING
         is_operation_running = self._is_starting or self._is_stopping
 
@@ -171,83 +349,58 @@ class GlassFishTab(QWidget):
         self._refresh_button.setEnabled(not is_operation_running)
 
         if is_operation_running:
-            if self._is_starting:
-                self._operation_label.setText("Iniciando servidor...")
-            elif self._is_stopping:
-                self._operation_label.setText("Parando servidor...")
+            self._operation_label.setText(
+                "Iniciando..." if self._is_starting else "Parando..."
+            )
         else:
             self._operation_label.setText("")
 
     @Slot()
     def _on_start_clicked(self) -> None:
-        """Callback do botão iniciar."""
         self._is_starting = True
         self._update_buttons_state(self._gf_service.current_status)
         self._gf_service.start_domain()
 
     @Slot()
     def _on_stop_clicked(self) -> None:
-        """Callback do botão parar."""
         self._is_stopping = True
         self._update_buttons_state(self._gf_service.current_status)
         self._gf_service.stop_domain()
 
     @Slot()
     def _on_restart_clicked(self) -> None:
-        """Callback do botão reiniciar."""
         self._is_stopping = True
         self._update_buttons_state(self._gf_service.current_status)
         self._gf_service.restart_domain()
 
     @Slot()
     def _on_refresh_clicked(self) -> None:
-        """Callback do botão atualizar."""
         self._gf_service.check_status_async()
+        self._refresh_apps()
 
     @Slot(ServerStatus)
     def _on_status_changed(self, status: ServerStatus) -> None:
-        """Callback quando o status muda."""
         self._is_starting = False
         self._is_stopping = False
         self._status_widget.update_status(status)
         self._update_buttons_state(status)
 
+        if status == ServerStatus.RUNNING:
+            self._refresh_apps()
+        elif status == ServerStatus.STOPPED:
+            self._apps_table.setRowCount(0)
+
     @Slot(str, bool)
     def _on_command_executed(self, command: str, success: bool) -> None:
-        """Callback quando um comando é executado."""
         self._is_starting = False
         self._is_stopping = False
         self._update_buttons_state(self._gf_service.current_status)
 
-        if success:
-            self._log_viewer.append_log_line(f"[SUCESSO] Comando '{command}' executado com sucesso")
-        else:
-            self._log_viewer.append_log_line(f"[FALHA] Comando '{command}' falhou")
+        if command in ("start-domain", "restart-domain") and success:
+            self._refresh_apps()
 
     @Slot(str)
     def _on_error_occurred(self, error: str) -> None:
-        """Callback quando ocorre um erro."""
         self._is_starting = False
         self._is_stopping = False
         self._update_buttons_state(self._gf_service.current_status)
-        self._log_viewer.append_log_line(f"[ERRO] {error}")
-
-    @Slot(ServerStatus)
-    def _on_status_widget_changed(self, status: ServerStatus) -> None:
-        """Callback quando o status widget muda."""
-        self._update_buttons_state(status)
-
-    @Slot(ResourceMetrics)
-    def _on_metrics_updated(self, metrics: ResourceMetrics) -> None:
-        """Callback quando as métricas são atualizadas."""
-        self._metrics_panel.update_metrics(metrics)
-
-    @Slot()
-    def _on_history_updated(self) -> None:
-        """Callback quando o histórico é atualizado."""
-        self._metrics_panel.update_graphs(self._monitor_service.history)
-
-    @Slot(str)
-    def _on_log_message(self, message: str) -> None:
-        """Callback para mensagens de log."""
-        self._log_viewer.append_log_line(message)
