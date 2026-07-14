@@ -1,12 +1,12 @@
 """Serviço de gerenciamento do PostgreSQL."""
 
-import subprocess
 import enum
+import subprocess
+import threading
 from dataclasses import dataclass
-from typing import Callable
 
 from loguru import logger
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QObject, Signal
 
 
 class PostgresStatus(enum.Enum):
@@ -17,18 +17,6 @@ class PostgresStatus(enum.Enum):
 
 
 @dataclass
-class CommandResult:
-    command: str
-    returncode: int
-    stdout: str
-    stderr: str
-
-    @property
-    def success(self) -> bool:
-        return self.returncode == 0
-
-
-@dataclass
 class PostgresInfo:
     name: str = "PostgreSQL"
     version: str = ""
@@ -36,55 +24,20 @@ class PostgresInfo:
     status: PostgresStatus = PostgresStatus.UNKNOWN
 
 
-def _run_system_command(args: list[str], timeout: int = 10) -> CommandResult:
-    cmd_str = " ".join(args)
+def _run_cmd(args: list[str], timeout: int = 10) -> tuple[int, str, str]:
     try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        r = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW,
-            encoding="cp1252",
-            errors="replace",
+            encoding="cp1252", errors="replace",
         )
-        return CommandResult(
-            command=cmd_str,
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
+        return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
-        return CommandResult(command=cmd_str, returncode=-2, stdout="", stderr="Comando não encontrado")
+        return -2, "", "Comando não encontrado"
     except subprocess.TimeoutExpired:
-        return CommandResult(command=cmd_str, returncode=-1, stdout="", stderr="Timeout")
+        return -1, "", "Timeout"
     except Exception as e:
-        return CommandResult(command=cmd_str, returncode=-3, stdout="", stderr=str(e))
-
-
-class PostgresStatusWorker(QObject):
-    finished = Signal(PostgresInfo)
-    error = Signal(str)
-
-    @Slot()
-    def run(self) -> None:
-        info = PostgresInfo()
-
-        for name in ["postgresql", "postgresql-x64-16", "postgresql-x64-15", "postgresql-x64-14", "postgresql-x64-13"]:
-            result = _run_system_command(["sc", "query", name], timeout=10)
-            if result.returncode == 0:
-                info.name = name
-                if "RUNNING" in result.stdout.upper():
-                    info.status = PostgresStatus.RUNNING
-                elif "STOPPED" in result.stdout.upper():
-                    info.status = PostgresStatus.STOPPED
-                break
-
-        ver_result = _run_system_command(["psql", "--version"], timeout=5)
-        if ver_result.success:
-            info.version = ver_result.stdout.strip()
-
-        self.finished.emit(info)
+        return -3, "", str(e)
 
 
 class PostgresService(QObject):
@@ -92,6 +45,8 @@ class PostgresService(QObject):
     command_executed = Signal(str, bool)
     error_occurred = Signal(str)
     info_loaded = Signal(PostgresInfo)
+
+    _result_ready = Signal(object)
 
     SERVICE_NAMES = [
         "postgresql", "postgresql-x64-16", "postgresql-x64-15",
@@ -102,7 +57,8 @@ class PostgresService(QObject):
         super().__init__()
         self._current_status = PostgresStatus.UNKNOWN
         self._service_name: str | None = None
-        self._worker_thread: QThread | None = None
+        self._pending_callbacks: list = []
+        self._result_ready.connect(self._handle_result, Qt.ConnectionType.QueuedConnection)
 
     @property
     def current_status(self) -> PostgresStatus:
@@ -112,89 +68,95 @@ class PostgresService(QObject):
         if self._service_name:
             return self._service_name
         for name in self.SERVICE_NAMES:
-            result = _run_system_command(["sc", "query", name], timeout=5)
-            if result.returncode == 0:
+            rc, out, _ = _run_cmd(["sc", "query", name], timeout=5)
+            if rc == 0:
                 self._service_name = name
                 return name
         return self.SERVICE_NAMES[0]
 
+    def _run_async(self, func, callback) -> None:
+        self._pending_callbacks.append(callback)
+
+        def _worker():
+            result = func()
+            self._result_ready.emit(result)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _handle_result(self, result) -> None:
+        callback = self._pending_callbacks.pop(0)
+        callback(result)
+
     def check_status_async(self) -> None:
-        if self._worker_thread is not None:
-            try:
-                if self._worker_thread.isRunning():
-                    return
-            except RuntimeError:
-                pass
-            self._worker_thread = None
+        def _do():
+            info = PostgresInfo()
+            for name in self.SERVICE_NAMES:
+                rc, out, _ = _run_cmd(["sc", "query", name])
+                if rc == 0:
+                    info.name = name
+                    upper = out.upper()
+                    if "RUNNING" in upper:
+                        info.status = PostgresStatus.RUNNING
+                    elif "STOPPED" in upper:
+                        info.status = PostgresStatus.STOPPED
+                    break
 
-        self._worker_thread = QThread()
-        worker = PostgresStatusWorker()
-        worker.moveToThread(self._worker_thread)
-        worker.finished.connect(self._on_status_received)
-        worker.error.connect(self._on_status_error)
-        self._worker_thread.started.connect(worker.run)
-        self._worker_thread.finished.connect(self._worker_thread.quit)
-        self._worker_thread.start()
+            rc, out, _ = _run_cmd(["psql", "--version"], timeout=5)
+            if rc == 0:
+                info.version = out.strip()
+            return info
 
-    def _on_status_received(self, info: PostgresInfo) -> None:
-        old = self._current_status
-        self._current_status = info.status
-        self._service_name = info.name
-        if old != info.status:
+        def _on_result(info: PostgresInfo):
+            self._current_status = info.status
+            self._service_name = info.name
             self.status_changed.emit(info.status)
-        self.info_loaded.emit(info)
+            self.info_loaded.emit(info)
 
-    def _on_status_error(self, msg: str) -> None:
-        self._current_status = PostgresStatus.ERROR
-        self.status_changed.emit(PostgresStatus.ERROR)
-        self.error_occurred.emit(msg)
+        self._run_async(_do, _on_result)
 
-    def _run_net_command(self, action: str, callback: Callable[[CommandResult], None] | None = None) -> str:
+    def start(self, callback=None) -> None:
         svc = self._find_service_name()
-        args = ["net", action, svc]
 
-        def _on_complete(result: CommandResult) -> None:
-            if result.success:
-                self._current_status = PostgresStatus.RUNNING if action == "start" else PostgresStatus.STOPPED
-                self.status_changed.emit(self._current_status)
+        def _do():
+            return _run_cmd(["net", "start", svc], timeout=30)
+
+        def _on_result(result):
+            rc, out, err = result
+            if rc == 0:
+                self._current_status = PostgresStatus.RUNNING
+                self.status_changed.emit(PostgresStatus.RUNNING)
             else:
-                self.error_occurred.emit(result.stderr)
+                self.error_occurred.emit(err)
             if callback:
                 callback(result)
-            self.command_executed.emit(action, result.success)
+            self.command_executed.emit("start", rc == 0)
 
-        thread = QThread()
-        worker = _SystemCommandWorker(args)
-        worker.moveToThread(thread)
-        worker.finished.connect(_on_complete)
-        thread.started.connect(worker.run)
-        thread.finished.connect(thread.quit)
-        thread.start()
-        return action
+        self._run_async(_do, _on_result)
 
-    def start(self, callback: Callable[[CommandResult], None] | None = None) -> str:
-        return self._run_net_command("start", callback)
+    def stop(self, callback=None) -> None:
+        svc = self._find_service_name()
 
-    def stop(self, callback: Callable[[CommandResult], None] | None = None) -> str:
-        return self._run_net_command("stop", callback)
+        def _do():
+            return _run_cmd(["net", "stop", svc], timeout=30)
 
-    def restart(self, callback: Callable[[CommandResult], None] | None = None) -> str:
-        def _after_stop(result: CommandResult) -> None:
-            if result.success:
+        def _on_result(result):
+            rc, out, err = result
+            if rc == 0:
+                self._current_status = PostgresStatus.STOPPED
+                self.status_changed.emit(PostgresStatus.STOPPED)
+            else:
+                self.error_occurred.emit(err)
+            if callback:
+                callback(result)
+            self.command_executed.emit("stop", rc == 0)
+
+        self._run_async(_do, _on_result)
+
+    def restart(self, callback=None) -> None:
+        def _after_stop(result):
+            rc, _, _ = result
+            if rc == 0:
                 self.start(callback)
             elif callback:
                 callback(result)
-        return self._run_net_command("stop", _after_stop)
-
-
-class _SystemCommandWorker(QObject):
-    finished = Signal(CommandResult)
-
-    def __init__(self, args: list[str]) -> None:
-        super().__init__()
-        self._args = args
-
-    @Slot()
-    def run(self) -> None:
-        result = _run_system_command(self._args, timeout=30)
-        self.finished.emit(result)
+        self.stop(callback=_after_stop)

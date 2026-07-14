@@ -278,7 +278,6 @@ class GlassFishTab(QWidget):
                     self._version_label.setText(line.replace("GlassFish encontrado em: ", ""))
 
         self._gf_service.check_status_async()
-        self._refresh_apps()
 
     def shutdown(self) -> None:
         pass

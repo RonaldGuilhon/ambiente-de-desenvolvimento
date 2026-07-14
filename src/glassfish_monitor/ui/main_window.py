@@ -93,7 +93,8 @@ class MainWindow(QMainWindow):
                 tab.shutdown()
 
     def initialize(self) -> None:
-        self._glassfish_tab.initialize()
+        for tab, _ in self._tabs:
+            tab.initialize()
 
     def closeEvent(self, event) -> None:
         for tab, _ in self._tabs:
