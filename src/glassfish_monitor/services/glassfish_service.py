@@ -123,8 +123,13 @@ class GlassFishService(QObject):
 
     def check_status_async(self) -> None:
         """Verifica o status do servidor de forma assíncrona."""
-        if self._worker_thread and self._worker_thread.isRunning():
-            return
+        if self._worker_thread is not None:
+            try:
+                if self._worker_thread.isRunning():
+                    return
+            except RuntimeError:
+                pass
+            self._worker_thread = None
 
         self._worker_thread = QThread()
         self._worker = StatusWorker(self._process_manager, self._domain_name)
@@ -133,7 +138,7 @@ class GlassFishService(QObject):
         self._worker.finished.connect(self._on_status_received)
         self._worker.error.connect(self._on_status_error)
         self._worker_thread.started.connect(self._worker.run)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.finished.connect(self._worker_thread.quit)
 
         self._worker_thread.start()
 
@@ -146,18 +151,12 @@ class GlassFishService(QObject):
             logger.info(f"Status alterado: {old_status.value} -> {info.status.value}")
             self.status_changed.emit(info.status)
 
-        if self._worker_thread:
-            self._worker_thread.quit()
-
     def _on_status_error(self, error_msg: str) -> None:
         """Callback quando ocorre erro ao verificar status."""
         logger.error(f"Erro ao verificar status: {error_msg}")
         self._current_status = ServerStatus.ERROR
         self.status_changed.emit(ServerStatus.ERROR)
         self.error_occurred.emit(error_msg)
-
-        if self._worker_thread:
-            self._worker_thread.quit()
 
     def start_domain(self, callback: Callable[[CommandResult], None] | None = None) -> str:
         """Inicia o domínio do GlassFish."""
