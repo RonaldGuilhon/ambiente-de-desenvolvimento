@@ -1,14 +1,12 @@
 """Serviço de gerenciamento do MySQL."""
 
-import enum
 import subprocess
+import enum
 from dataclasses import dataclass
 from typing import Callable
 
 from loguru import logger
 from PySide6.QtCore import QObject, QThread, Signal, Slot
-
-from glassfish_monitor.services.process_manager import CommandResult, ProcessManager
 
 
 class MySQLStatus(enum.Enum):
@@ -19,6 +17,18 @@ class MySQLStatus(enum.Enum):
 
 
 @dataclass
+class CommandResult:
+    command: str
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def success(self) -> bool:
+        return self.returncode == 0
+
+
+@dataclass
 class MySQLInfo:
     name: str = "MySQL"
     version: str = ""
@@ -26,45 +36,51 @@ class MySQLInfo:
     status: MySQLStatus = MySQLStatus.UNKNOWN
 
 
+def _run_system_command(args: list[str], timeout: int = 10) -> CommandResult:
+    cmd_str = " ".join(args)
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            encoding="cp1252",
+            errors="replace",
+        )
+        return CommandResult(
+            command=cmd_str,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+    except FileNotFoundError:
+        return CommandResult(command=cmd_str, returncode=-2, stdout="", stderr="Comando não encontrado")
+    except subprocess.TimeoutExpired:
+        return CommandResult(command=cmd_str, returncode=-1, stdout="", stderr="Timeout")
+    except Exception as e:
+        return CommandResult(command=cmd_str, returncode=-3, stdout="", stderr=str(e))
+
+
 class MySQLStatusWorker(QObject):
     finished = Signal(MySQLInfo)
     error = Signal(str)
-
-    def __init__(self, pm: ProcessManager) -> None:
-        super().__init__()
-        self._pm = pm
 
     @Slot()
     def run(self) -> None:
         info = MySQLInfo()
 
-        result = self._pm.run_command(["sc", "query", "MySQL"], timeout=10)
-        if result.success and "RUNNING" in result.stdout.upper():
-            info.status = MySQLStatus.RUNNING
-        elif result.success and "STOPPED" in result.stdout.upper():
-            info.status = MySQLStatus.STOPPED
-        else:
-            result2 = self._pm.run_command(["sc", "query", "MySQL80"], timeout=10)
-            if result2.success and "RUNNING" in result2.stdout.upper():
-                info.status = MySQLStatus.RUNNING
-                info.name = "MySQL80"
-            elif result2.success and "STOPPED" in result2.stdout.upper():
-                info.status = MySQLStatus.STOPPED
-                info.name = "MySQL80"
-            else:
-                result3 = self._pm.run_command(["sc", "query", "MariaDB"], timeout=10)
-                if result3.success and "RUNNING" in result3.stdout.upper():
+        for name in ["MySQL", "MySQL80", "MariaDB"]:
+            result = _run_system_command(["sc", "query", name], timeout=10)
+            if result.returncode == 0:
+                info.name = name
+                if "RUNNING" in result.stdout.upper():
                     info.status = MySQLStatus.RUNNING
-                    info.name = "MariaDB"
-                elif result3.success and "STOPPED" in result3.stdout.upper():
+                elif "STOPPED" in result.stdout.upper():
                     info.status = MySQLStatus.STOPPED
-                    info.name = "MariaDB"
-                else:
-                    info.status = MySQLStatus.UNKNOWN
+                break
 
-        ver_result = self._pm.run_command(
-            ["mysql", "--version"], timeout=5
-        )
+        ver_result = _run_system_command(["mysql", "--version"], timeout=5)
         if ver_result.success:
             info.version = ver_result.stdout.strip()
 
@@ -81,7 +97,6 @@ class MySQLService(QObject):
 
     def __init__(self) -> None:
         super().__init__()
-        self._pm = ProcessManager()
         self._current_status = MySQLStatus.UNKNOWN
         self._service_name: str | None = None
         self._worker_thread: QThread | None = None
@@ -94,23 +109,28 @@ class MySQLService(QObject):
         if self._service_name:
             return self._service_name
         for name in self.SERVICE_NAMES:
-            result = self._pm.run_command(["sc", "query", name], timeout=5)
-            if result.success and ("RUNNING" in result.stdout.upper() or "STOPPED" in result.stdout.upper()):
+            result = _run_system_command(["sc", "query", name], timeout=5)
+            if result.returncode == 0:
                 self._service_name = name
                 return name
         return self.SERVICE_NAMES[0]
 
     def check_status_async(self) -> None:
-        if self._worker_thread and self._worker_thread.isRunning():
-            return
+        if self._worker_thread is not None:
+            try:
+                if self._worker_thread.isRunning():
+                    return
+            except RuntimeError:
+                pass
+            self._worker_thread = None
 
         self._worker_thread = QThread()
-        worker = MySQLStatusWorker(self._pm)
+        worker = MySQLStatusWorker()
         worker.moveToThread(self._worker_thread)
         worker.finished.connect(self._on_status_received)
         worker.error.connect(self._on_status_error)
         self._worker_thread.started.connect(worker.run)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.finished.connect(self._worker_thread.quit)
         self._worker_thread.start()
 
     def _on_status_received(self, info: MySQLInfo) -> None:
@@ -120,62 +140,58 @@ class MySQLService(QObject):
         if old != info.status:
             self.status_changed.emit(info.status)
         self.info_loaded.emit(info)
-        if self._worker_thread:
-            self._worker_thread.quit()
 
     def _on_status_error(self, msg: str) -> None:
         self._current_status = MySQLStatus.ERROR
         self.status_changed.emit(MySQLStatus.ERROR)
         self.error_occurred.emit(msg)
-        if self._worker_thread:
-            self._worker_thread.quit()
+
+    def _run_net_command(self, action: str, callback: Callable[[CommandResult], None] | None = None) -> str:
+        svc = self._find_service_name()
+        args = ["net", action, svc]
+
+        def _on_complete(result: CommandResult) -> None:
+            if result.success:
+                self._current_status = MySQLStatus.RUNNING if action == "start" else MySQLStatus.STOPPED
+                self.status_changed.emit(self._current_status)
+            else:
+                self.error_occurred.emit(result.stderr)
+            if callback:
+                callback(result)
+            self.command_executed.emit(action, result.success)
+
+        thread = QThread()
+        worker = _SystemCommandWorker(args)
+        worker.moveToThread(thread)
+        worker.finished.connect(_on_complete)
+        thread.started.connect(worker.run)
+        thread.finished.connect(thread.quit)
+        thread.start()
+        return action
 
     def start(self, callback: Callable[[CommandResult], None] | None = None) -> str:
-        svc = self._find_service_name()
-
-        def _on_complete(result: CommandResult) -> None:
-            if result.success:
-                self._current_status = MySQLStatus.RUNNING
-                self.status_changed.emit(MySQLStatus.RUNNING)
-            else:
-                self.error_occurred.emit(result.stderr)
-            if callback:
-                callback(result)
-            self.command_executed.emit("start", result.success)
-
-        return self._pm.run_command_async(
-            ["net", "start", svc],
-            callback=_on_complete,
-            output_callback=lambda msg: logger.info(msg),
-            command_id="mysql_start",
-        )
+        return self._run_net_command("start", callback)
 
     def stop(self, callback: Callable[[CommandResult], None] | None = None) -> str:
-        svc = self._find_service_name()
-
-        def _on_complete(result: CommandResult) -> None:
-            if result.success:
-                self._current_status = MySQLStatus.STOPPED
-                self.status_changed.emit(MySQLStatus.STOPPED)
-            else:
-                self.error_occurred.emit(result.stderr)
-            if callback:
-                callback(result)
-            self.command_executed.emit("stop", result.success)
-
-        return self._pm.run_command_async(
-            ["net", "stop", svc],
-            callback=_on_complete,
-            output_callback=lambda msg: logger.info(msg),
-            command_id="mysql_stop",
-        )
+        return self._run_net_command("stop", callback)
 
     def restart(self, callback: Callable[[CommandResult], None] | None = None) -> str:
         def _after_stop(result: CommandResult) -> None:
             if result.success:
                 self.start(callback)
-            else:
-                if callback:
-                    callback(result)
+            elif callback:
+                callback(result)
+        return self._run_net_command("stop", _after_stop)
 
-        return self.stop(callback=_after_stop)
+
+class _SystemCommandWorker(QObject):
+    finished = Signal(CommandResult)
+
+    def __init__(self, args: list[str]) -> None:
+        super().__init__()
+        self._args = args
+
+    @Slot()
+    def run(self) -> None:
+        result = _run_system_command(self._args, timeout=30)
+        self.finished.emit(result)
