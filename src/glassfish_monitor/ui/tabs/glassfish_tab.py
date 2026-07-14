@@ -3,7 +3,7 @@
 import webbrowser
 
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -24,25 +24,6 @@ from glassfish_monitor.services.glassfish_service import (
 )
 from glassfish_monitor.ui.styles.themes import Colors
 from glassfish_monitor.ui.widgets.status_widget import StatusWidget
-
-
-class AppListWorker(QObject):
-    """Worker para buscar aplicações em background."""
-
-    finished = Signal(list)
-    error = Signal(str)
-
-    def __init__(self, service: GlassFishService) -> None:
-        super().__init__()
-        self._service = service
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            apps = self._service.list_deployed_apps()
-            self.finished.emit(apps)
-        except Exception as e:
-            self.error.emit(str(e))
 
 
 class InfoCard(QFrame):
@@ -125,7 +106,6 @@ class GlassFishTab(QWidget):
         self._gf_service = glassfish_service
         self._is_starting = False
         self._is_stopping = False
-        self._worker_thread: QThread | None = None
         self._admin_url = f"http://localhost:{GlassFishConfig.ADMIN_PORT}"
         self._http_url = f"http://localhost:{GlassFishConfig.HTTP_PORT}"
         self._setup_ui()
@@ -294,32 +274,22 @@ class GlassFishTab(QWidget):
         if valid:
             lines = message.split("\n")
             for line in lines:
-                if line.startswith("Asadmin:"):
-                    pass
-                elif line.startswith("Domínios:"):
-                    pass
-                elif line.startswith("GlassFish"):
+                if line.startswith("GlassFish"):
                     self._version_label.setText(line.replace("GlassFish encontrado em: ", ""))
 
         self._gf_service.check_status_async()
         self._refresh_apps()
 
     def shutdown(self) -> None:
-        self._gf_service.cancel_all_operations()
+        pass
 
     def _refresh_apps(self) -> None:
         if self._gf_service.current_status != ServerStatus.RUNNING:
             self._apps_table.setRowCount(0)
             return
 
-        self._worker_thread = QThread()
-        worker = AppListWorker(self._gf_service)
-        worker.moveToThread(self._worker_thread)
-        worker.finished.connect(self._on_apps_loaded)
-        worker.error.connect(lambda e: logger.error(f"Erro ao listar apps: {e}"))
-        self._worker_thread.started.connect(worker.run)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
-        self._worker_thread.start()
+        apps = self._gf_service.list_deployed_apps()
+        self._on_apps_loaded(apps)
 
     def _on_apps_loaded(self, apps: list[DeployedApp]) -> None:
         self._apps_table.setRowCount(len(apps))
